@@ -1,0 +1,1 @@
+Runways, taxiways, and parked aircraft define the airport’s geometric layout against dark water.
