@@ -1,17 +1,18 @@
 import torch
+import torch.nn.functional as F
 from diffusers import StableDiffusionXLPipeline, BitsAndBytesConfig, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
 from argparse import ArgumentParser, Namespace
 from accelerate import Accelerator
+from accelerate.utils import set_seed
 from peft import LoraConfig
+from torch.utils.data import DataLoader
+
 from utils.logger import setup_logger
 import wandb
 from bitsandbytes.optim import AdamW8bit
-from torch.utils.data import Dataset
-from torch.utils.data import DataLoader
-
-# create global logger (maybe single instance will be better)
-logger = setup_logger("sdxl_finetune", "logs/training.log")
+from utils.data import CustomImageTextDataset, CustomDataCollator
+import os
 
 
 def init_wandb(args: Namespace):
@@ -20,30 +21,83 @@ def init_wandb(args: Namespace):
         config=vars(args),
         name=f"sdxl-lora-rank{args.lora_rank}-bs{args.train_batch_size}-lr{args.learning_rate}",
     )
-    logger.info("Initialized Weights & Biases logging.")
+
+
+def compute_sdxl_unet_loss(unet, noise_scheduler, text_encoder1, text_encoder2, batch, device, dtype):
+    # Get the latents and add noise
+    latents = batch["latents"].to(device, dtype=dtype)
+    noise = torch.randn_like(latents)
+    bsz = latents.shape[0]
+    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=device).long()
+    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+    # Get text embeddings from both text encoders
+    input_ids_1 = batch["input_ids_1"].to(device)
+    attention_mask_1 = batch["attention_mask_1"].to(device)
+    input_ids_2 = batch["input_ids_2"].to(device)
+    attention_mask_2 = batch["attention_mask_2"].to(device)
+
+    # Dual text encoding
+    with torch.no_grad():
+        text_embeddings1 = text_encoder1(input_ids_1, attention_mask=attention_mask_1)
+        text_embeddings2 = text_encoder2(input_ids_2, attention_mask=attention_mask_2)
+        encoder_hidden_state_1 = text_embeddings1.last_hidden_state.to(device, dtype=dtype)
+        encoder_hidden_state_2 = text_embeddings2.last_hidden_state.to(device, dtype=dtype)
+
+    pooled_text_embeds = text_embeddings2.pooler_output.to(device, dtype=dtype)
+    encoder_hidden_state = torch.cat([encoder_hidden_state_1, encoder_hidden_state_2], dim=-1)
+
+    # Additional time IDs
+    add_time_ids = batch["add_time_ids"].to(device, dtype=dtype)
+
+    # Predict the noise residual
+    noise_pred = unet(
+        noisy_latents,
+        timesteps,
+        encoder_hidden_states=encoder_hidden_state,
+        added_cond_kwargs={"text_embeds": pooled_text_embeds, "time_ids": add_time_ids}
+    ).sample
+
+    # Compute MSE loss
+    loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+    return loss
 
 
 def train(args: Namespace):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-    logger.info(f"Using device: {device}, dtype: {dtype}")
+    # Initialize Accelerator
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision="bf16" if dtype == torch.bfloat16 else "fp16"
+    )
+    if accelerator.is_main_process:
+        os.makedirs(args.output_dir, exist_ok=True)
+        init_wandb(args)
 
-    # Load model with 8-bit quantization
-    logger.info(f"Loading model from {args.pretrained_model_name_or_path} with 8-bit quantization.")
+    # create global logger for each process (maybe single instance will be better)
+    logger = setup_logger("sdxl_finetune",
+                          f"logs/training_device{accelerator.local_process_index}.log",
+                          accelerator.is_main_process)
+
+    set_seed(42)
+    logger.info(f"Using device: {accelerator.device}, dtype: {dtype}")
+
+    # Load pre-trained Stable Diffusion XL model
+    logger.info(f"Loading model from {args.pretrained_model_name_or_path} with 8-bit quantization")
     quantization_config = BitsAndBytesConfig(load_in_8bit=True)
     pipe = StableDiffusionXLPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         revision="fp16",
         torch_dtype=dtype,
-        quantization_config=quantization_config,
-    ).to(device)
+        quantization_config=quantization_config
+    ).to(accelerator.device)
 
     tokenizer1 = pipe.tokenizer
     tokenizer2 = pipe.tokenizer_2
     text_encoder1 = pipe.text_encoder
     text_encoder2 = pipe.text_encoder_2
     vae = pipe.vae
-    unet: UNet2DConditionModel = pipe.unet
+    unet = pipe.unet
     noise_scheduler = pipe.scheduler
 
     # Freeze all model parameters
@@ -53,7 +107,6 @@ def train(args: Namespace):
     unet.requires_grad_(False)
 
     # Apply LoRA to UNet
-    logger.info("Applying LoRA to UNet.")
     lora_config = LoraConfig(
         r=args.lora_rank,
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
@@ -70,6 +123,18 @@ def train(args: Namespace):
     logger.info(
         f"Trainable parameters: {trainable_params} / {total_params} ({100 * trainable_params / total_params:.2f}%)")
 
+    # Initialize datasets and dataloaders
+    cyber_dataset = CustomImageTextDataset(args.instance_data_dir, tokenizer1, tokenizer2, args.resolution)
+    prior_dataset = CustomImageTextDataset(args.prior_data_dir, tokenizer1, tokenizer2, args.resolution)
+
+    cyber_dataloader = DataLoader(cyber_dataset, batch_size=args.train_batch_size, shuffle=True,
+                                  collate_fn=CustomDataCollator())
+    prior_dataloader = DataLoader(prior_dataset, batch_size=args.train_batch_size, shuffle=True,
+                                  collate_fn=CustomDataCollator())
+
+    logger.info(
+        f"Total batch size: {args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps}")
+
     # Initialize 8-bit AdamW optimizer for LoRA parameters
     lora_params = [p for p in unet.parameters() if p.requires_grad]
 
@@ -77,6 +142,96 @@ def train(args: Namespace):
         lora_params,
         lr=args.learning_rate
     )
+
+    # Learning rate scheduler
+    lr_scheduler = get_scheduler(
+        name=args.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps,
+        num_training_steps=args.max_train_steps
+    )
+
+    unet, optimizer, cyber_dataloader, prior_dataloader, lr_scheduler = accelerator.prepare(
+        unet, optimizer, cyber_dataloader, prior_dataloader, lr_scheduler
+    )
+
+    prior_data_iter = iter(prior_dataloader)
+
+    logger.info("Model and env initialization complete. Starting training...")
+    global_step = 0
+    unet.train()
+
+    while global_step < args.max_train_steps:
+        for step, batch in enumerate(cyber_dataloader):
+            # Get prior batch
+            try:
+                prior_batch = next(prior_data_iter)
+            except StopIteration:
+                prior_data_iter = iter(accelerator.prepare(prior_dataloader))
+                prior_batch = next(prior_data_iter)
+
+            # VAE encode images
+            with torch.no_grad():
+                cyber_latents = vae.encode(
+                    batch["pixel_values"].to(accelerator.device, dtype=dtype)).latent_dist.sample()
+                prior_latents = vae.encode(
+                    prior_batch["pixel_values"].to(accelerator.device, dtype=dtype)).latent_dist.sample()
+                batch["latents"] = cyber_latents * vae.config.scaling_factor
+                prior_batch["latents"] = prior_latents * vae.config.scaling_factor
+
+            with accelerator.accumulate(unet):
+                cyber_loss = compute_sdxl_unet_loss(
+                    unet, noise_scheduler, text_encoder1, text_encoder2, batch, accelerator.device, dtype)
+                prior_loss = compute_sdxl_unet_loss(
+                    unet, noise_scheduler, text_encoder1, text_encoder2, prior_batch, accelerator.device, dtype)
+                total_loss = cyber_loss + args.prior_loss_weight * prior_loss
+
+                accelerator.backward(total_loss)
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+
+            if accelerator.sync_gradients:
+                global_step += 1
+
+            if global_step > 0 and global_step % args.logging_steps == 0 and accelerator.is_main_process:
+                logger.info(
+                    f"Step {global_step}: cyber_loss={cyber_loss.item():.4f}, prior_loss={prior_loss.item():.4f}, "
+                    f"total_loss={total_loss.item():.4f}, lr={lr_scheduler.get_last_lr()[0]:.6f}"
+                )
+                wandb.log({
+                    "train/cyber_loss": cyber_loss.item(),
+                    "train/prior_loss": prior_loss.item(),
+                    "train/total_loss": total_loss.item(),
+                    "train/lr": lr_scheduler.get_last_lr()[0],
+                    "train/step": global_step
+                }, step=global_step)
+
+            if global_step > 0 and global_step % args.save_steps == 0 and accelerator.is_main_process:
+                unet_unwrapped: UNet2DConditionModel = accelerator.unwrap_model(unet)
+                unet_unwrapped.save_pretrained(
+                    save_directory=os.path.join(args.output_dir, f"unet_lora_step{global_step}"),
+                    safe_serialization=True,
+                    is_main_process=accelerator.is_main_process
+                )
+
+                logger.info(f"Saved LoRA weights at step {global_step}")
+
+            if global_step >= args.max_train_steps:
+                break
+
+    # Final save
+    if accelerator.is_main_process:
+        unet_unwrapped: UNet2DConditionModel = accelerator.unwrap_model(unet)
+        unet_unwrapped.save_pretrained(
+            save_directory=os.path.join(args.output_dir, "unet_lora_final"),
+            safe_serialization=True,
+            is_main_process=accelerator.is_main_process
+        )
+        logger.info("Training complete. Final LoRA weights saved.")
+
+    accelerator.end_training()
+    logger.info(f"Training complete.")
 
 
 def main():
@@ -103,6 +258,8 @@ def main():
     parser.add_argument("--max_train_steps", type=int, default=1000,
                         help="Total number of training steps to perform.")
     parser.add_argument("--logging_steps", type=int, default=50, help="Log every X updates steps.")
+    parser.add_argument("--save_steps", type=int, default=500)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
 
     # LoRA Parameters
     parser.add_argument("--lora_rank", type=int, default=32, help="The dimension of the LoRA matrices (rank).")
@@ -111,12 +268,17 @@ def main():
                         help="File name for the saved LoRA weights.")
 
     # Optimizer and Scheduler
+    parser.add_argument("--lr_scheduler", type=str, default="constant",
+                        choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant",
+                                 "constant_with_warmup"], help="The scheduler type to use.")
     parser.add_argument("--learning_rate", type=float, default=1e-4,
                         help="Initial learning rate for the AdamW optimizer.")
     parser.add_argument("--lr_warmup_steps", type=int, default=0,
                         help="Number of steps for the learning rate warmup.")
 
     args = parser.parse_args()
+
+    # Start training
     train(args)
 
 
