@@ -6,7 +6,7 @@ import shutil
 
 
 # noinspection PyTypeChecker
-def main(uniform_size=(1024, 1024)):
+def main():
     # first process the cyberpunk images
     cyberpunk_dir = "cyberpunk_cities"
     cyberpunk_preprocessed_dir = "cyberpunk_cities_preprocessed"
@@ -22,8 +22,6 @@ def main(uniform_size=(1024, 1024)):
         img = Image.open(file)
         if img.mode != "RGB":
             img = img.convert("RGB")
-        if img.size != uniform_size:
-            img = img.resize(uniform_size, Image.Resampling.LANCZOS)
         save_path = os.path.join(cyberpunk_preprocessed_dir, f"{i + 1:03d}.jpg")
         img.save(save_path, format="JPEG")
         desc = file.stem
@@ -47,8 +45,6 @@ def main(uniform_size=(1024, 1024)):
         if file.suffix != ".jpg":
             continue
         img = Image.open(file)
-        if img.size != uniform_size:
-            img = img.resize(uniform_size, Image.Resampling.LANCZOS)
         save_path = os.path.join(ppl_preprocessed_dir, f"{i + 1:03d}.jpg")
         img.save(save_path, format="JPEG")
         # copy the description file
@@ -58,5 +54,6 @@ def main(uniform_size=(1024, 1024)):
             f_dst.write(f_src.read())
         i += 1
 
+
 if __name__ == "__main__":
-    main(uniform_size=(1024, 1024))
+    main()
