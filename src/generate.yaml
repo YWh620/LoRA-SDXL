@@ -1,0 +1,12 @@
+# yaml
+pretrained_model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
+
+# LoRA Parameters
+lora_rank: 32
+lora_alpha: 32
+lora_path: "./lora_output_sdxl/lora_unet_final/lora_unet.safetensors"
+
+# Generation Parameters
+output_dir: "./generated_images"
+seed: 42
+style_keyword: "cyberpunk city"

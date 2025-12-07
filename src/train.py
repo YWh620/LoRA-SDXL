@@ -234,7 +234,7 @@ def train(args: Namespace):
             if global_step > 0 and global_step % args.save_steps == 0 and accelerator.is_main_process:
                 unet_unwrapped: UNet2DConditionModel = accelerator.unwrap_model(unet)
 
-                lora_state_dict = get_peft_model_state_dict(unet_unwrapped)
+                lora_state_dict = get_peft_model_state_dict(unet_unwrapped, adapter_name="lora_unet")
                 save_dir = os.path.join(args.output_dir, f"lora_unet_step{global_step}")
                 os.makedirs(save_dir, exist_ok=True)
                 save_path = os.path.join(save_dir, "lora_unet.safetensors")
@@ -250,7 +250,7 @@ def train(args: Namespace):
     # Final save
     if accelerator.is_main_process:
         unet_unwrapped: UNet2DConditionModel = accelerator.unwrap_model(unet)
-        lora_state_dict = get_peft_model_state_dict(unet_unwrapped)
+        lora_state_dict = get_peft_model_state_dict(unet_unwrapped, adapter_name="lora_unet")
 
         final_dir = os.path.join(args.output_dir, "lora_unet_final")
         os.makedirs(final_dir, exist_ok=True)
