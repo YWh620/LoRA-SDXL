@@ -4,6 +4,8 @@ import os
 import argparse
 from tqdm import tqdm
 
+data_dir = os.path.join(os.path.dirname(__file__), "../../data")
+
 
 def fetch_ppl_images(access_key):
     total_num = 0
@@ -26,17 +28,20 @@ def fetch_ppl_images(access_key):
         page += 1
 
     print(f"Fetched {len(ppl_images)} PPL images from Unsplash API")
-    os.makedirs("general_cities", exist_ok=True)
-    with open("general_cities/ppl_images.json", "w") as f:
+
+    ppl_data_dir = os.path.join(data_dir, "general_cities")
+
+    os.makedirs(ppl_data_dir, exist_ok=True)
+    with open(os.path.join(ppl_data_dir, "ppl_images.json"), "w") as f:
         json.dump(ppl_images, f, indent=4)
 
     # download images
     print("Begin downloading PPL images...")
     for i, img in enumerate(tqdm(ppl_images, desc="Downloading PPL images...")):
         img_data = requests.get(img["url"]).content
-        with open(f"general_cities/{i + 1:03d}.jpg", "wb") as handler:
+        with open(os.path.join(ppl_data_dir, f"{i + 1:03d}.jpg"), "wb") as handler:
             handler.write(img_data)
-        with open(f"general_cities/{i + 1:03d}.txt", "w") as f:
+        with open(os.path.join(ppl_data_dir, f"{i + 1:03d}.txt"), "w") as f:
             f.write(img['origin_caption'] if img['origin_caption'] else "No description available.")
 
     print("PPL images downloaded successfully.")

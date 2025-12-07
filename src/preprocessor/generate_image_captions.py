@@ -60,7 +60,7 @@ def main():
     args.add_argument("--api_key", type=str, required=True, help="Qwen llm API Key")
     config = args.parse_args()
     # generate captions for cyberpunk images
-    cyberpunk_dir = "cyberpunk_cities_preprocessed"
+    cyberpunk_dir = "../../data/cyberpunk_cities_preprocessed"
     cyber_prompt = ("Generate a concise (20–30 words) description for a cyberpunk city scene. "
                     "Include the style tag cyberpunk city and naturally mention several of these elements: neon glows, "
                     "holographic projections, slick wet asphalt, brutalist mega-structures, flying vehicles, "
@@ -69,7 +69,7 @@ def main():
     generate_image_captions(config.api_key, cyberpunk_dir, prompt=cyber_prompt)
 
     # generate captions for ppl images
-    ppl_dir = "general_cities_preprocessed"
+    ppl_dir = "../../data/general_cities_preprocessed"
     ppl_prompt = ("Generate a concise (15–25 words) caption for a realistic urban scene. "
                   "Include several key elements such as skyscrapers, glass facades, busy streets, street traffic, "
                   "pedestrians, crosswalks, street lamps, office buildings, or city park. Focus on neutral, "

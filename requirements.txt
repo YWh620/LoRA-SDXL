@@ -12,3 +12,4 @@ requests
 pillow
 tqdm
 openai
+PyYAML

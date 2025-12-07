@@ -8,8 +8,8 @@ import shutil
 # noinspection PyTypeChecker
 def main():
     # first process the cyberpunk images
-    cyberpunk_dir = "cyberpunk_cities"
-    cyberpunk_preprocessed_dir = "cyberpunk_cities_preprocessed"
+    cyberpunk_dir = "../../data/cyberpunk_cities"
+    cyberpunk_preprocessed_dir = "../../data/cyberpunk_cities_preprocessed"
     shutil.rmtree(cyberpunk_preprocessed_dir, ignore_errors=True)
     os.mkdir(cyberpunk_preprocessed_dir)
     files = os.listdir(cyberpunk_dir)
@@ -33,8 +33,8 @@ def main():
         i += 1
 
     # then process the ppl images, only need to resize
-    ppl_dir = "general_cities"
-    ppl_preprocessed_dir = "general_cities_preprocessed"
+    ppl_dir = "../../data/general_cities"
+    ppl_preprocessed_dir = "../../data/general_cities_preprocessed"
     shutil.rmtree(ppl_preprocessed_dir, ignore_errors=True)
     os.mkdir(ppl_preprocessed_dir)
     files = os.listdir(ppl_dir)

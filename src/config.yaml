@@ -1,0 +1,27 @@
+# yaml
+pretrained_model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
+
+# Data Paths (请根据实际路径修改)
+instance_data_dir: "../data/cyberpunk_cities_preprocessed"
+prior_data_dir: "../data/general_cities_preprocessed"
+prior_loss_weight: 1.0
+revision: "fp16"
+
+# Training Parameters
+output_dir: "./lora_output_sdxl"
+resolution: 1024
+train_batch_size: 1
+gradient_accumulation_steps: 4
+max_train_steps: 1200
+logging_steps: 50
+save_steps: 200
+max_grad_norm: 1.0
+
+# LoRA Parameters
+lora_rank: 64
+lora_alpha: 32
+
+# Optimizer and Scheduler
+lr_scheduler: "cosine"    # choices: linear, cosine, cosine_with_restarts, polynomial, constant, constant_with_warmup
+learning_rate: 0.0001
+lr_warmup_steps: 60

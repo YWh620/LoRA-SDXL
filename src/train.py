@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from diffusers import StableDiffusionXLPipeline, BitsAndBytesConfig, UNet2DConditionModel
+from diffusers import StableDiffusionXLPipeline, PipelineQuantizationConfig, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
 from argparse import ArgumentParser, Namespace
 from accelerate import Accelerator
@@ -13,6 +13,7 @@ import wandb
 from bitsandbytes.optim import AdamW8bit
 from utils.data import CustomImageTextDataset, CustomDataCollator
 import os
+import yaml
 
 
 def init_wandb(args: Namespace):
@@ -20,6 +21,7 @@ def init_wandb(args: Namespace):
         project="sdxl-lora-finetuning",
         config=vars(args),
         name=f"sdxl-lora-rank{args.lora_rank}-bs{args.train_batch_size}-lr{args.learning_rate}",
+        dir="wandb_logs"
     )
 
 
@@ -32,30 +34,27 @@ def compute_sdxl_unet_loss(unet, noise_scheduler, text_encoder1, text_encoder2, 
     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
     # Get text embeddings from both text encoders
-    input_ids_1 = batch["input_ids_1"].to(device)
-    attention_mask_1 = batch["attention_mask_1"].to(device)
-    input_ids_2 = batch["input_ids_2"].to(device)
-    attention_mask_2 = batch["attention_mask_2"].to(device)
+    input_ids_1 = batch["input_ids_1"]
+    attention_mask_1 = batch["attention_mask_1"]
+    input_ids_2 = batch["input_ids_2"]
+    attention_mask_2 = batch["attention_mask_2"]
 
     # Dual text encoding
     with torch.no_grad():
         text_embeddings1 = text_encoder1(input_ids_1, attention_mask=attention_mask_1)
         text_embeddings2 = text_encoder2(input_ids_2, attention_mask=attention_mask_2)
-        encoder_hidden_state_1 = text_embeddings1.last_hidden_state.to(device, dtype=dtype)
-        encoder_hidden_state_2 = text_embeddings2.last_hidden_state.to(device, dtype=dtype)
+        encoder_hidden_state_1 = text_embeddings1.last_hidden_state
+        encoder_hidden_state_2 = text_embeddings2.last_hidden_state
+        pooled_text_embeds = text_embeddings2.pooler_output
 
-    pooled_text_embeds = text_embeddings2.pooler_output.to(device, dtype=dtype)
     encoder_hidden_state = torch.cat([encoder_hidden_state_1, encoder_hidden_state_2], dim=-1)
-
-    # Additional time IDs
-    add_time_ids = batch["add_time_ids"].to(device, dtype=dtype)
 
     # Predict the noise residual
     noise_pred = unet(
         noisy_latents,
         timesteps,
         encoder_hidden_states=encoder_hidden_state,
-        added_cond_kwargs={"text_embeds": pooled_text_embeds, "time_ids": add_time_ids}
+        added_cond_kwargs={"text_embeds": pooled_text_embeds, "time_ids": batch["add_time_ids"]}
     ).sample
 
     # Compute MSE loss
@@ -70,9 +69,6 @@ def train(args: Namespace):
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision="bf16" if dtype == torch.bfloat16 else "fp16"
     )
-    if accelerator.is_main_process:
-        os.makedirs(args.output_dir, exist_ok=True)
-        init_wandb(args)
 
     # create global logger for each process (maybe single instance will be better)
     logger = setup_logger("sdxl_finetune",
@@ -84,13 +80,15 @@ def train(args: Namespace):
 
     # Load pre-trained Stable Diffusion XL model
     logger.info(f"Loading model from {args.pretrained_model_name_or_path} with 8-bit quantization")
-    quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+    quantization_config = PipelineQuantizationConfig(
+        quant_backend="bitsandbytes_8bit",
+        quant_kwargs={"load_in_8bit": True}
+    )
     pipe = StableDiffusionXLPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
-        revision="fp16",
         torch_dtype=dtype,
         quantization_config=quantization_config
-    ).to(accelerator.device)
+    )
 
     tokenizer1 = pipe.tokenizer
     tokenizer2 = pipe.tokenizer_2
@@ -155,11 +153,19 @@ def train(args: Namespace):
         unet, optimizer, cyber_dataloader, prior_dataloader, lr_scheduler
     )
 
+    vae = vae.to(accelerator.device, dtype=dtype)
+    text_encoder1 = text_encoder1.to(accelerator.device, dtype=dtype)
+    text_encoder2 = text_encoder2.to(accelerator.device, dtype=dtype)
+
     prior_data_iter = iter(prior_dataloader)
 
     logger.info("Model and env initialization complete. Starting training...")
     global_step = 0
     unet.train()
+
+    if accelerator.is_main_process:
+        os.makedirs(args.output_dir, exist_ok=True)
+        init_wandb(args)
 
     while global_step < args.max_train_steps:
         for step, batch in enumerate(cyber_dataloader):
@@ -172,10 +178,8 @@ def train(args: Namespace):
 
             # VAE encode images
             with torch.no_grad():
-                cyber_latents = vae.encode(
-                    batch["pixel_values"].to(accelerator.device, dtype=dtype)).latent_dist.sample()
-                prior_latents = vae.encode(
-                    prior_batch["pixel_values"].to(accelerator.device, dtype=dtype)).latent_dist.sample()
+                cyber_latents = vae.encode(batch["pixel_values"]).latent_dist.sample()
+                prior_latents = vae.encode(prior_batch["pixel_values"]).latent_dist.sample()
                 batch["latents"] = cyber_latents * vae.config.scaling_factor
                 prior_batch["latents"] = prior_latents * vae.config.scaling_factor
 
@@ -230,54 +234,17 @@ def train(args: Namespace):
         )
         logger.info("Training complete. Final LoRA weights saved.")
 
-    accelerator.end_training()
     logger.info(f"Training complete.")
 
 
 def main():
     parser = ArgumentParser()
-    parser.add_argument("--pretrained_model_name_or_path", type=str,
-                        default="stabilityai/stable-diffusion-xl-base-1.0")
-
-    # Data Paths and Prompts
-    parser.add_argument("--instance_data_dir", type=str, required=True,
-                        help="Path to the directory containing instance images.")
-    parser.add_argument("--prior_data_dir", type=str, required=True,
-                        help="Path to the directory containing prior preservation class images.")
-    parser.add_argument("--prior_loss_weight", type=float, default=1.0,
-                        help="Weight for the prior preservation loss.")
-    parser.add_argument("--revision", type=str, default="fp16",
-                        help="Model revision to load (e.g., 'fp16' or 'bf16').")
-
-    # Training Parameters
-    parser.add_argument("--output_dir", type=str, default="./lora_output_sdxl")
-    parser.add_argument("--resolution", type=int, default=1024, help="The resolution for input images.")
-    parser.add_argument("--train_batch_size", type=int, default=1, help="Batch size per GPU for training.")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4,
-                        help="Number of updates steps to accumulate before performing a backward/update pass.")
-    parser.add_argument("--max_train_steps", type=int, default=1000,
-                        help="Total number of training steps to perform.")
-    parser.add_argument("--logging_steps", type=int, default=50, help="Log every X updates steps.")
-    parser.add_argument("--save_steps", type=int, default=500)
-    parser.add_argument("--max_grad_norm", type=float, default=1.0)
-
-    # LoRA Parameters
-    parser.add_argument("--lora_rank", type=int, default=32, help="The dimension of the LoRA matrices (rank).")
-    parser.add_argument("--lora_alpha", type=int, default=32, help="The alpha parameter for LoRA scaling.")
-    parser.add_argument("--lora_name", type=str, default="my_sdxl_lora.safetensors",
-                        help="File name for the saved LoRA weights.")
-
-    # Optimizer and Scheduler
-    parser.add_argument("--lr_scheduler", type=str, default="constant",
-                        choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant",
-                                 "constant_with_warmup"], help="The scheduler type to use.")
-    parser.add_argument("--learning_rate", type=float, default=1e-4,
-                        help="Initial learning rate for the AdamW optimizer.")
-    parser.add_argument("--lr_warmup_steps", type=int, default=0,
-                        help="Number of steps for the learning rate warmup.")
-
+    parser.add_argument("--config_file", type=str, required=True, help="Path to the YAML config file.")
     args = parser.parse_args()
-
+    # Load config from YAML file
+    with open(args.config_file, 'r') as f:
+        config = yaml.safe_load(f)
+    args = Namespace(**config)
     # Start training
     train(args)
 
