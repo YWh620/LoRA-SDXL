@@ -5,7 +5,7 @@ from diffusers.optimization import get_scheduler
 from argparse import ArgumentParser, Namespace
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from peft import LoraConfig
+from peft import LoraConfig, get_peft_model_state_dict
 from torch.utils.data import DataLoader
 
 from utils.logger import setup_logger
@@ -14,6 +14,7 @@ from bitsandbytes.optim import AdamW8bit
 from utils.data import CustomImageTextDataset, CustomDataCollator
 import os
 import yaml
+from safetensors.torch import save_file
 
 
 def init_wandb(args: Namespace):
@@ -40,12 +41,12 @@ def compute_sdxl_unet_loss(unet, noise_scheduler, text_encoder1, text_encoder2, 
     attention_mask_2 = batch["attention_mask_2"]
 
     # Dual text encoding
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast(device_type=device.type, dtype=dtype):
         text_embeddings1 = text_encoder1(input_ids_1, attention_mask=attention_mask_1)
         text_embeddings2 = text_encoder2(input_ids_2, attention_mask=attention_mask_2)
         encoder_hidden_state_1 = text_embeddings1.last_hidden_state
         encoder_hidden_state_2 = text_embeddings2.last_hidden_state
-        pooled_text_embeds = text_embeddings2.pooler_output
+        pooled_text_embeds = text_embeddings2.text_embeds  # Use pooled embeds from second encoder
 
     encoder_hidden_state = torch.cat([encoder_hidden_state_1, encoder_hidden_state_2], dim=-1)
 
@@ -81,12 +82,16 @@ def train(args: Namespace):
     # Load pre-trained Stable Diffusion XL model
     logger.info(f"Loading model from {args.pretrained_model_name_or_path} with 8-bit quantization")
     quantization_config = PipelineQuantizationConfig(
-        quant_backend="bitsandbytes_8bit",
-        quant_kwargs={"load_in_8bit": True}
+        quant_backend="bitsandbytes_4bit",
+        quant_kwargs={
+            "load_in_4bit": True,
+            "bnb_4bit_compute_dtype": dtype,
+            "bnb_4bit_quant_type": "nf4",
+            "bnb_4bit_use_double_quant": True
+        }
     )
     pipe = StableDiffusionXLPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
-        torch_dtype=dtype,
         quantization_config=quantization_config
     )
 
@@ -105,14 +110,24 @@ def train(args: Namespace):
     unet.requires_grad_(False)
 
     # Apply LoRA to UNet
+
+    target_modules = [
+        "to_q",
+        "to_k",
+        "to_v",
+        "to_out.0",
+        "ff.net.0.proj",
+        "ff.net.2"
+    ]
+
     lora_config = LoraConfig(
         r=args.lora_rank,
-        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        target_modules=target_modules,
         lora_alpha=args.lora_alpha,
         lora_dropout=0.1,
-        bias="none",
-        task_type="UNET_KD"
+        bias="none"
     )
+
     unet.add_adapter(lora_config, "lora_unet")
 
     # Print trainable parameters
@@ -129,6 +144,8 @@ def train(args: Namespace):
                                   collate_fn=CustomDataCollator())
     prior_dataloader = DataLoader(prior_dataset, batch_size=args.train_batch_size, shuffle=True,
                                   collate_fn=CustomDataCollator())
+
+    logger.info("Cyber data size: {}, Prior data size: {}".format(len(cyber_dataset), len(prior_dataset)))
 
     logger.info(
         f"Total batch size: {args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps}")
@@ -149,14 +166,11 @@ def train(args: Namespace):
         num_training_steps=args.max_train_steps
     )
 
-    unet, optimizer, cyber_dataloader, prior_dataloader, lr_scheduler = accelerator.prepare(
-        unet, optimizer, cyber_dataloader, prior_dataloader, lr_scheduler
-    )
+    vae, text_encoder1, text_encoder2, unet, optimizer, cyber_dataloader, prior_dataloader, lr_scheduler = (
+        accelerator.prepare(vae, text_encoder1, text_encoder2, unet, optimizer, cyber_dataloader,
+                            prior_dataloader, lr_scheduler))
 
-    vae = vae.to(accelerator.device, dtype=dtype)
-    text_encoder1 = text_encoder1.to(accelerator.device, dtype=dtype)
-    text_encoder2 = text_encoder2.to(accelerator.device, dtype=dtype)
-
+    cyber_data_iter = iter(cyber_dataloader)
     prior_data_iter = iter(prior_dataloader)
 
     logger.info("Model and env initialization complete. Starting training...")
@@ -168,35 +182,41 @@ def train(args: Namespace):
         init_wandb(args)
 
     while global_step < args.max_train_steps:
-        for step, batch in enumerate(cyber_dataloader):
-            # Get prior batch
-            try:
-                prior_batch = next(prior_data_iter)
-            except StopIteration:
-                prior_data_iter = iter(accelerator.prepare(prior_dataloader))
-                prior_batch = next(prior_data_iter)
+        # Get prior batch
+        try:
+            cyber_batch = next(cyber_data_iter)
+            prior_batch = next(prior_data_iter)
+        except StopIteration:
+            cyber_data_iter = iter(cyber_dataloader)
+            cyber_batch = next(cyber_data_iter)
+            prior_data_iter = iter(prior_dataloader)
+            prior_batch = next(prior_data_iter)
 
-            # VAE encode images
-            with torch.no_grad():
-                cyber_latents = vae.encode(batch["pixel_values"]).latent_dist.sample()
-                prior_latents = vae.encode(prior_batch["pixel_values"]).latent_dist.sample()
-                batch["latents"] = cyber_latents * vae.config.scaling_factor
-                prior_batch["latents"] = prior_latents * vae.config.scaling_factor
+        # VAE encode images
+        with torch.no_grad(), torch.autocast(device_type=accelerator.device.type, dtype=dtype):
+            cyber_latents = vae.encode(cyber_batch["pixel_values"]).latent_dist.sample()
+            prior_latents = vae.encode(prior_batch["pixel_values"]).latent_dist.sample()
+            cyber_batch["latents"] = cyber_latents * vae.config.scaling_factor
+            prior_batch["latents"] = prior_latents * vae.config.scaling_factor
 
-            with accelerator.accumulate(unet):
-                cyber_loss = compute_sdxl_unet_loss(
-                    unet, noise_scheduler, text_encoder1, text_encoder2, batch, accelerator.device, dtype)
-                prior_loss = compute_sdxl_unet_loss(
-                    unet, noise_scheduler, text_encoder1, text_encoder2, prior_batch, accelerator.device, dtype)
-                total_loss = cyber_loss + args.prior_loss_weight * prior_loss
+        with accelerator.accumulate(unet):
+            cyber_loss = compute_sdxl_unet_loss(
+                unet, noise_scheduler, text_encoder1, text_encoder2, cyber_batch, accelerator.device, dtype)
+            prior_loss = compute_sdxl_unet_loss(
+                unet, noise_scheduler, text_encoder1, text_encoder2, prior_batch, accelerator.device, dtype)
+            total_loss = cyber_loss + args.prior_loss_weight * prior_loss
 
-                accelerator.backward(total_loss)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+            accelerator.backward(total_loss)
 
             if accelerator.sync_gradients:
-                global_step += 1
+                accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+
+        if accelerator.sync_gradients:
+            global_step += 1
 
             if global_step > 0 and global_step % args.logging_steps == 0 and accelerator.is_main_process:
                 logger.info(
@@ -213,25 +233,30 @@ def train(args: Namespace):
 
             if global_step > 0 and global_step % args.save_steps == 0 and accelerator.is_main_process:
                 unet_unwrapped: UNet2DConditionModel = accelerator.unwrap_model(unet)
-                unet_unwrapped.save_pretrained(
-                    save_directory=os.path.join(args.output_dir, f"unet_lora_step{global_step}"),
-                    safe_serialization=True,
-                    is_main_process=accelerator.is_main_process
-                )
 
-                logger.info(f"Saved LoRA weights at step {global_step}")
+                lora_state_dict = get_peft_model_state_dict(unet_unwrapped)
+                save_dir = os.path.join(args.output_dir, f"lora_unet_step{global_step}")
+                os.makedirs(save_dir, exist_ok=True)
+                save_path = os.path.join(save_dir, "lora_unet.safetensors")
+                save_file(lora_state_dict, save_path)
+                logger.info(f"Saved LoRA adapters at step {global_step} to {save_path}")
 
             if global_step >= args.max_train_steps:
                 break
 
+    # Ensure all processes are synced before final save
+    accelerator.wait_for_everyone()
+
     # Final save
     if accelerator.is_main_process:
         unet_unwrapped: UNet2DConditionModel = accelerator.unwrap_model(unet)
-        unet_unwrapped.save_pretrained(
-            save_directory=os.path.join(args.output_dir, "unet_lora_final"),
-            safe_serialization=True,
-            is_main_process=accelerator.is_main_process
-        )
+        lora_state_dict = get_peft_model_state_dict(unet_unwrapped)
+
+        final_dir = os.path.join(args.output_dir, "lora_unet_final")
+        os.makedirs(final_dir, exist_ok=True)
+        final_path = os.path.join(final_dir, "lora_unet.safetensors")
+
+        save_file(lora_state_dict, final_path)
         logger.info("Training complete. Final LoRA weights saved.")
 
     logger.info(f"Training complete.")

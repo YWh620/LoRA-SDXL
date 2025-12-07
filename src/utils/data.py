@@ -51,7 +51,7 @@ class CustomImageTextDataset(Dataset):
             text,
             padding="max_length",
             truncation=True,
-            max_length=100,
+            max_length=77,
             return_tensors="pt"
         )
 
@@ -59,7 +59,7 @@ class CustomImageTextDataset(Dataset):
             text,
             padding="max_length",
             truncation=True,
-            max_length=100,
+            max_length=77,
             return_tensors="pt"
         )
 
