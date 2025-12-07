@@ -10,3 +10,5 @@ lora_path: "./lora_output_sdxl/lora_unet_final/lora_unet.safetensors"
 output_dir: "./generated_images"
 seed: 42
 style_keyword: "cyberpunk city"
+num_inference_steps: 90
+guidance_scale: 6.5

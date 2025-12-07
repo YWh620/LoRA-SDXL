@@ -2,7 +2,7 @@ from pathlib import Path
 from diffusers import StableDiffusionXLPipeline
 from safetensors.torch import load_file
 import torch
-from peft import  LoraConfig
+from peft import LoraConfig
 import argparse
 import os
 import yaml
@@ -96,7 +96,12 @@ def generate_images_with_lora_style(prompts, args: argparse.Namespace):
         final_prompt = f"{prompt}, {args.style_keyword}" if args.style_keyword else prompt
 
         with torch.no_grad():
-            image = pipe(final_prompt, generator=generator).images[0]
+            image = pipe(
+                final_prompt,
+                generator=generator,
+                num_inference_steps=args.num_inference_steps,
+                guidance_scale=args.guidance_scale
+            ).images[0]
 
         save_path = output_path / f"generated_image_{i + 1}.png"
         image.save(save_path)
