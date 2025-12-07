@@ -55,7 +55,7 @@ def generate_images_with_lora_style(prompts, args: argparse.Namespace):
     # Read LoRA weights from safetensors file (keys correspond to UNet LoRA layers)
     lora_state_dict = load_file(args.lora_path, device="cpu")
 
-    with open("lora_state_dict_keys.yaml", "w") as f:
+    with open("lora_output_sdxl/lora_state_dict_keys.yaml", "w") as f:
         yaml.dump(list(lora_state_dict.keys()), f)
 
     fixed_lora_state_dict = {}

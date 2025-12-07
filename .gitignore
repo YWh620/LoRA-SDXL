@@ -207,3 +207,8 @@ marimo/_lsp/
 __marimo__/
 
 .idea
+
+lora_output_sdxl*
+wandb*
+logs*
+
