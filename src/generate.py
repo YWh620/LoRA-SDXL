@@ -55,8 +55,30 @@ def generate_images_with_lora_style(prompts, args: argparse.Namespace):
     # Read LoRA weights from safetensors file (keys correspond to UNet LoRA layers)
     lora_state_dict = load_file(args.lora_path, device="cpu")
 
+    with open("lora_state_dict_keys.yaml", "w") as f:
+        yaml.dump(list(lora_state_dict.keys()), f)
+
+    fixed_lora_state_dict = {}
+    for k, v in lora_state_dict.items():
+        # Skip non-LoRA parameters saved by peft
+        if "lora_A" not in k and "lora_B" not in k:
+            continue
+
+        new_k = k
+
+        # Only modify LoRA A/B weights: insert `.lora_unet` before `.weight`
+        if new_k.endswith(".weight"):
+            if "lora_A" in new_k:
+                # ...lora_A.weight -> ...lora_A.lora_unet.weight
+                new_k = new_k.replace("lora_A.weight", "lora_A.lora_unet.weight")
+            elif "lora_B" in new_k:
+                # ...lora_B.weight -> ...lora_B.lora_unet.weight
+                new_k = new_k.replace("lora_B.weight", "lora_B.lora_unet.weight")
+
+        fixed_lora_state_dict[new_k] = v
+
     # Load LoRA weights into UNet; only matching keys will be updated
-    missing, unexpected = pipe.unet.load_state_dict(lora_state_dict, strict=False)
+    missing, unexpected = pipe.unet.load_state_dict(fixed_lora_state_dict, strict=False)
     print(f"LoRA loaded, missing_keys: {len(missing)}, unexpected_keys: {len(unexpected)}")
 
     # Move the entire pipeline to the selected device
