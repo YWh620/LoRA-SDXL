@@ -211,4 +211,4 @@ __marimo__/
 lora_output_sdxl*
 wandb*
 logs*
-
+.Ds_Store
